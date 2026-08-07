@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>kinova_teleop</name>
+  <version>0.1.0</version>
+  <description>Safe hand-gesture teleoperation for Kinova Gen3 robots.</description>
+  <maintainer email="nidhi@example.com">Nidhi Sakpal</maintainer>
+  <license>Apache-2.0</license>
+  <depend>rclpy</depend>
+  <depend>geometry_msgs</depend>
+  <depend>control_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>kinova_teleop_interfaces</depend>
+  <exec_depend>kinova_hand_perception</exec_depend>
+  <exec_depend>moveit_servo</exec_depend>
+  <exec_depend>moveit_configs_utils</exec_depend>
+  <exec_depend>tf_transformations</exec_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <export><build_type>ament_python</build_type></export>
+</package>
+

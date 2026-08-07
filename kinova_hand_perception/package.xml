@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>kinova_hand_perception</name>
+  <version>0.1.0</version>
+  <description>MediaPipe RGB-D hand tracking for Kinova teleoperation.</description>
+  <maintainer email="nidhi@example.com">Nidhi Sakpal</maintainer>
+  <license>Apache-2.0</license>
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>cv_bridge</depend>
+  <depend>kinova_teleop_interfaces</depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <export><build_type>ament_python</build_type></export>
+</package>
+
