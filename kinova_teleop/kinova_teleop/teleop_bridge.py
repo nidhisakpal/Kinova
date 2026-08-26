@@ -2,11 +2,10 @@
 
 from enum import Enum
 import math
-
 import numpy as np
 import rclpy
 from control_msgs.action import GripperCommand
-from geometry_msgs.msg import Point, TwistStamped
+from geometry_msgs.msg import TwistStamped
 from kinova_teleop_interfaces.msg import HandTracking
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
@@ -24,8 +23,6 @@ class State(Enum):
 
 
 class TeleopBridge(Node):
-    """Dead-man state machine and Cartesian feedback controller."""
-
     def __init__(self):
         super().__init__("kinova_teleop_bridge")
         defaults = {
@@ -33,15 +30,15 @@ class TeleopBridge(Node):
             "servo_topic": "/servo_node/delta_twist_cmds",
             "base_frame": "base_link",
             "command_frame": "base_link",
-            "ee_frame": "tool_frame",
+            "ee_frame": "bracelet_link",
             "gripper_action": "/robotiq_gripper_controller/gripper_cmd",
-            "axis_map": "z,-x,-y",
+            "axis_map": "x,-y,z",
             "hand_scale": 1.0,
             "linear_gain": 2.0,
             "angular_gain": 1.5,
             "max_linear_speed": 0.12,
             "max_angular_speed": 0.5,
-            "tracking_timeout_s": 0.25,
+            "tracking_timeout_s": 0.75,
             "hand_jump_limit_m": 0.12,
             "x_limits": "0.20,0.70",
             "y_limits": "-0.40,0.40",
@@ -57,22 +54,17 @@ class TeleopBridge(Node):
         self.command_frame = str(self.get_parameter("command_frame").value)
         self.ee_frame = str(self.get_parameter("ee_frame").value)
         self.axis_map = [x.strip() for x in str(self.get_parameter("axis_map").value).split(",")]
-        if len(self.axis_map) != 3 or any(
-                x.lstrip("-") not in {"x", "y", "z"} for x in self.axis_map):
+        if len(self.axis_map) != 3 or any(x.lstrip("-") not in {"x", "y", "z"} for x in self.axis_map):
             raise ValueError("axis_map must contain three entries selected from x,y,z,-x,-y,-z")
-        self.limits = np.array([
-            self._pair("x_limits"), self._pair("y_limits"), self._pair("z_limits")])
+        self.limits = np.array([self._pair("x_limits"), self._pair("y_limits"), self._pair("z_limits")])
 
         self.tf_buffer = Buffer(cache_time=Duration(seconds=2.0))
         self.tf_listener = TransformListener(self.tf_buffer, self)
-        self.twist_pub = self.create_publisher(
-            TwistStamped, str(self.get_parameter("servo_topic").value), 10)
+        self.twist_pub = self.create_publisher(TwistStamped, str(self.get_parameter("servo_topic").value), 10)
         self.marker_pub = self.create_publisher(Marker, "/kinova_teleop/status_marker", 2)
         self.box_pub = self.create_publisher(Marker, "/kinova_teleop/workspace_marker", 2)
-        self.create_subscription(
-            HandTracking, str(self.get_parameter("tracking_topic").value), self.on_tracking, 10)
-        self.gripper = ActionClient(
-            self, GripperCommand, str(self.get_parameter("gripper_action").value))
+        self.create_subscription(HandTracking, str(self.get_parameter("tracking_topic").value), self.on_tracking, 10)
+        self.gripper = ActionClient(self, GripperCommand, str(self.get_parameter("gripper_action").value))
 
         self.state = State.WAITING
         self.tracking = None
@@ -85,6 +77,7 @@ class TeleopBridge(Node):
         self.last_gripper_gesture = "None"
         self.create_timer(0.02, self.control_tick)
         self.create_timer(0.1, self.marker_tick)
+        self.get_logger().info("Kinova teleop bridge started.")
 
     def _pair(self, name):
         values = [float(v) for v in str(self.get_parameter(name).value).split(",")]
@@ -93,17 +86,15 @@ class TeleopBridge(Node):
         return values
 
     def on_tracking(self, msg):
-        self.tracking = msg
-        self.last_tracking_time = self.get_clock().now()
         if self.state == State.SHUTDOWN:
             return
+        # Ignore individual invalid webcam frames. control_tick handles sustained loss.
         if not msg.valid:
-            self.state = State.LOST
-            self.previous_hand = None
-            self.previous_gesture = "None"
             return
+        self.tracking = msg
+        self.last_tracking_time = self.get_clock().now()
+        hand = np.array([msg.point.x, msg.point.y, msg.point.z], dtype=float)
 
-        hand = np.array([msg.point.x, msg.point.y, msg.point.z])
         if self.previous_hand is not None:
             jump = np.linalg.norm(hand - self.previous_hand)
             if jump > float(self.get_parameter("hand_jump_limit_m").value):
@@ -112,28 +103,24 @@ class TeleopBridge(Node):
                 self.previous_gesture = "None"
                 return
         self.previous_hand = hand
-
         gesture = msg.gesture
-        if gesture == "Thumb_Down":
-            self.state = State.SHUTDOWN
-            self.hand_anchor = None
-            self.robot_anchor = None
-            self.get_logger().warning("Thumb down received: teleoperation shutdown latched")
-            return
+
         if gesture == "Thumb_Up":
             self.state = State.HOLD
             self.hand_anchor = hand
             pose = self.current_pose()
             if pose is not None:
                 self.robot_anchor, self.orientation_anchor = pose
+            else:
+                self.get_logger().warning("Thumb-up detected, but robot end-effector pose is unavailable.")
         elif self.previous_gesture == "Thumb_Up" and gesture != "Thumb_Up":
             pose = self.current_pose()
             if pose is not None:
                 self.hand_anchor = hand
                 self.robot_anchor, self.orientation_anchor = pose
                 self.state = State.TRACKING
+                self.get_logger().info("Teleoperation TRACKING enabled.")
         elif self.state == State.LOST:
-            # Lost tracking never auto-resumes; require thumb-up re-arming.
             pass
 
         if gesture in ("Closed_Fist", "Open_Palm") and gesture != self.last_gripper_gesture:
@@ -146,7 +133,8 @@ class TeleopBridge(Node):
     def current_pose(self):
         try:
             transform = self.tf_buffer.lookup_transform(
-                self.base_frame, self.ee_frame, rclpy.time.Time(), timeout=Duration(seconds=0.03))
+                self.base_frame, self.ee_frame, rclpy.time.Time(), timeout=Duration(seconds=0.05)
+            )
         except TransformException:
             return None
         t, q = transform.transform.translation, transform.transform.rotation
@@ -162,14 +150,14 @@ class TeleopBridge(Node):
 
     @staticmethod
     def quaternion_error(target, current):
-        # q_error = target * conjugate(current), returned as an angle-axis vector.
         tx, ty, tz, tw = target
         cx, cy, cz, cw = -current[0], -current[1], -current[2], current[3]
         q = np.array([
             tw*cx + tx*cw + ty*cz - tz*cy,
             tw*cy - tx*cz + ty*cw + tz*cx,
             tw*cz + tx*cy - ty*cx + tz*cw,
-            tw*cw - tx*cx - ty*cy - tz*cz])
+            tw*cw - tx*cx - ty*cy - tz*cz,
+        ])
         if q[3] < 0.0:
             q = -q
         norm = np.linalg.norm(q[:3])
@@ -184,6 +172,8 @@ class TeleopBridge(Node):
         return vector if norm <= maximum or norm == 0.0 else vector * maximum / norm
 
     def publish_stop(self):
+        if not rclpy.ok():
+            return
         msg = TwistStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self.command_frame
@@ -192,8 +182,8 @@ class TeleopBridge(Node):
     def control_tick(self):
         now = self.get_clock().now()
         stale = self.last_tracking_time is None or (
-            now - self.last_tracking_time).nanoseconds / 1e9 > float(
-                self.get_parameter("tracking_timeout_s").value)
+            now - self.last_tracking_time
+        ).nanoseconds / 1e9 > float(self.get_parameter("tracking_timeout_s").value)
         if stale and self.state not in (State.SHUTDOWN, State.WAITING):
             self.state = State.LOST
         if self.state != State.TRACKING or self.tracking is None:
@@ -215,7 +205,8 @@ class TeleopBridge(Node):
         desired = np.clip(desired, self.limits[:, 0], self.limits[:, 1])
         linear = (desired - position) * float(self.get_parameter("linear_gain").value)
         angular = self.quaternion_error(self.orientation_anchor, orientation) * float(
-            self.get_parameter("angular_gain").value)
+            self.get_parameter("angular_gain").value
+        )
         linear = self.clamp_norm(linear, float(self.get_parameter("max_linear_speed").value))
         angular = self.clamp_norm(angular, float(self.get_parameter("max_angular_speed").value))
 
@@ -232,7 +223,8 @@ class TeleopBridge(Node):
             return
         goal = GripperCommand.Goal()
         goal.command.position = float(self.get_parameter(
-            "gripper_closed_position" if closed else "gripper_open_position").value)
+            "gripper_closed_position" if closed else "gripper_open_position"
+        ).value)
         goal.command.max_effort = float(self.get_parameter("gripper_max_effort").value)
         self.gripper.send_goal_async(goal)
 
@@ -247,7 +239,7 @@ class TeleopBridge(Node):
         status.pose.position.z = self.limits[2, 1] + 0.1
         status.scale.z = 0.06
         status.color.a = 1.0
-        status.color.r = 1.0 if self.state != State.TRACKING else 0.0
+        status.color.r = 0.0 if self.state == State.TRACKING else 1.0
         status.color.g = 1.0 if self.state == State.TRACKING else 0.3
         status.text = self.state.value
         self.marker_pub.publish(status)
@@ -273,7 +265,15 @@ def main(args=None):
     node = TeleopBridge()
     try:
         rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     finally:
-        node.publish_stop()
+        if rclpy.ok():
+            node.publish_stop()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
